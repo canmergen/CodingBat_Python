@@ -98,3 +98,14 @@ def transform_numerics_targetwise_v3(X_train, y_train, X_val, X_test,
 
     group_log_df = pd.DataFrame(group_log)
     return X_train_new, X_val_new, X_test_new, group_log_df
+
+X_train_new, X_val_new, X_test_new, group_log_df = transform_numerics_targetwise_v3(
+    X_train=X_train,
+    y_train=y_train,
+    X_val=X_val,
+    X_test=X_test,
+    numerical_cols=['KAPS', 'SOME_NUMERIC_FEATURE'],  # Veya None dersen tüm numerikleri alır
+    min_group_size=50,               # Her grupta minimum kaç örnek olsun?
+    ratio_jump_threshold=0.05,       # Target ratio ne kadar zıplarsa yeni grup açılsın?
+    keep_original=True               # Orijinal feature da kalsın mı?
+)
