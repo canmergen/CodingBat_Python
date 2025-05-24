@@ -170,3 +170,9 @@ def transform_numerics_targetwise_v2(X_train, y_train, X_val, X_test,
 
     summary_df = pd.DataFrame(summary)
     return X_train_new, X_val_new, X_test_new, summary_df
+
+X_train_new, X_val_new, X_test_new, summary_df = transform_numerics_targetwise_v2(
+    X_train, y_train, X_val, X_test,
+    model_params={'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.1},
+    keep_original=True
+)
