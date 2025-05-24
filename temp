@@ -1,39 +1,63 @@
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import StratifiedKFold
-from xgboost import XGBClassifier
-from sklearn.metrics import roc_auc_score
-from scipy.stats.mstats import winsorize
-from sklearn.preprocessing import KBinsDiscretizer
-
-
-def transform_numerics_targetwise_v2(X_train, y_train, X_val, X_test,
-                                     model_params=None,
+def transform_numerics_targetwise_v3(X_train, y_train, X_val, X_test,
                                      numerical_cols=None,
-                                     categoric_detection_threshold=5,
-                                     keep_original=True,
-                                     n_bins=5):
+                                     min_group_size=50,
+                                     ratio_jump_threshold=0.05,
+                                     keep_original=True):
     """
-    Akıllı target-aware dönüşüm fonksiyonu (v2):
-    - Numerik feature'lar otomatik olarak incelenir
-    - Kategorik gibi davranan feature'lar (az unique değerli) hem numerik hem kategorik olarak işlenir
-    - Her dönüşüm XGB ile AUC bazında değerlendirilir
-    - En iyi dönüşüm seçilir ve sadece train bazında karar verilir
-    - Aynı dönüşüm val ve test'e uygulanır
-    - Orijinal feature korunur (keep_original=True)
+    Her numerik feature için target ratio bazlı otomatik gruplama yapar.
+    Gruplar target ratio'daki değişim hızına ve minimum grup büyüklüğüne göre belirlenir.
+    Yeni feature olarak grup numarası eklenir.
+    SQL dönüşümü yapılabilmesi için grup logları detaylı şekilde çıkarılır.
 
     Returns:
-        Transformed X_train, X_val, X_test ve dönüşüm özet tablosu
+        X_train_new, X_val_new, X_test_new, group_log_df
     """
-    if model_params is None:
-        model_params = {
-            'n_estimators': 50,
-            'max_depth': 3,
-            'learning_rate': 0.1,
-            'use_label_encoder': False,
-            'eval_metric': 'logloss',
-            'random_state': 42
-        }
+    def target_ratio_based_grouping(feature_series, target_series, min_group_size=50, ratio_jump_threshold=0.05):
+        stats = (
+            pd.DataFrame({
+                'value': feature_series,
+                'target': target_series
+            })
+            .groupby('value')
+            .agg(count=('target', 'count'), target_ratio=('target', 'mean'))
+            .sort_index()
+            .reset_index()
+        )
+
+        group_ids = []
+        current_group = 0
+        last_ratio = stats.loc[0, 'target_ratio']
+        group_start_idx = 0
+
+        for i in range(1, len(stats)):
+            current_ratio = stats.loc[i, 'target_ratio']
+            total_count = stats.loc[group_start_idx:i, 'count'].sum()
+
+            if abs(current_ratio - last_ratio) >= ratio_jump_threshold and total_count >= min_group_size:
+                group_ids.extend([current_group] * (i - group_start_idx))
+                current_group += 1
+                group_start_idx = i
+
+            last_ratio = current_ratio
+
+        group_ids.extend([current_group] * (len(stats) - len(group_ids)))
+        stats['group'] = group_ids
+
+        group_map = stats.set_index('value')['group'].to_dict()
+        grouped_feature = feature_series.map(group_map).fillna(-1).astype(int)
+
+        group_defs = []
+        for group_id in sorted(stats['group'].unique()):
+            group_values = stats[stats['group'] == group_id]['value'].tolist()
+            target_avg = stats[stats['group'] == group_id]['target_ratio'].mean()
+            group_defs.append({
+                'group_id': group_id,
+                'value_range': (min(group_values), max(group_values)),
+                'values': group_values,
+                'target_ratio_avg': round(target_avg, 4)
+            })
+
+        return grouped_feature, group_defs
 
     if numerical_cols is None:
         numerical_cols = X_train.select_dtypes(include=np.number).columns.tolist()
@@ -41,138 +65,36 @@ def transform_numerics_targetwise_v2(X_train, y_train, X_val, X_test,
     X_train_new = X_train.copy()
     X_val_new = X_val.copy()
     X_test_new = X_test.copy()
-    summary = []
-
-    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    group_log = []
 
     for col in numerical_cols:
-        col_data = X_train[col]
-        y_data = y_train
-
-        candidates = {}
-
-        # Orijinal feature
-        candidates['original'] = col_data.values
-
-        # Winsorized
         try:
-            capped = winsorize(col_data, limits=[0.01, 0.01])
-            candidates['winsorized'] = capped
-        except Exception:
-            pass
+            grouped_train, group_defs = target_ratio_based_grouping(X_train[col], y_train,
+                                                                     min_group_size=min_group_size,
+                                                                     ratio_jump_threshold=ratio_jump_threshold)
+            new_col_name = f"{col}_transformed_grouped"
+            X_train_new[new_col_name] = grouped_train
+            X_val_new[new_col_name] = X_val[col].map(grouped_train.drop_duplicates()).fillna(-1).astype(int)
+            X_test_new[new_col_name] = X_test[col].map(grouped_train.drop_duplicates()).fillna(-1).astype(int)
 
-        # Detect if feature is categoric-like
-        unique_values = col_data.nunique()
-        is_categoric_like = unique_values <= categoric_detection_threshold
+            for g in group_defs:
+                group_log.append({
+                    'feature': col,
+                    'new_feature': new_col_name,
+                    'group_id': g['group_id'],
+                    'value_range_start': g['value_range'][0],
+                    'value_range_end': g['value_range'][1],
+                    'target_ratio_avg': g['target_ratio_avg'],
+                    'value_list': g['values']
+                })
 
-        # Quantile binning + target encoding
-        try:
-            kbin_q = KBinsDiscretizer(n_bins=n_bins, encode='ordinal', strategy='quantile')
-            binned_q = kbin_q.fit_transform(col_data.values.reshape(-1, 1)).astype(int).flatten()
-            bin_ratios_q = pd.DataFrame({'bin': binned_q, 'target': y_data}).groupby('bin')['target'].mean()
-            encoded_q = [bin_ratios_q.get(b, 0) for b in binned_q]
-            candidates['quantile_target_encoded'] = encoded_q
-        except Exception:
-            pass
+            if keep_original:
+                X_train_new[col] = X_train[col]
+                X_val_new[col] = X_val[col]
+                X_test_new[col] = X_test[col]
 
-        # Uniform binning + target encoding
-        try:
-            kbin_u = KBinsDiscretizer(n_bins=n_bins, encode='ordinal', strategy='uniform')
-            binned_u = kbin_u.fit_transform(col_data.values.reshape(-1, 1)).astype(int).flatten()
-            bin_ratios_u = pd.DataFrame({'bin': binned_u, 'target': y_data}).groupby('bin')['target'].mean()
-            encoded_u = [bin_ratios_u.get(b, 0) for b in binned_u]
-            candidates['uniform_target_encoded'] = encoded_u
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"{col} için gruplayamadık: {e}")
 
-        # Categorical-like: direct target mean encoding
-        if is_categoric_like:
-            try:
-                cat_ratios = col_data.groupby(col_data).apply(lambda x: y_data[x.index].mean())
-                encoded_cat = [cat_ratios.get(v, 0) for v in col_data]
-                candidates['categoric_target_encoded'] = encoded_cat
-            except Exception:
-                pass
-
-        # Her dönüşüm için AUC karşılaştırması
-        best_auc = -1
-        best_name = None
-        for name, transformed_feature in candidates.items():
-            try:
-                X_temp = pd.DataFrame({col: transformed_feature})
-                aucs = []
-                for train_idx, val_idx in skf.split(X_temp, y_data):
-                    X_t, X_v = X_temp.iloc[train_idx], X_temp.iloc[val_idx]
-                    y_t, y_v = y_data.iloc[train_idx], y_data.iloc[val_idx]
-
-                    model = XGBClassifier(**model_params)
-                    model.fit(X_t, y_t)
-                    preds = model.predict_proba(X_v)[:, 1]
-                    auc = roc_auc_score(y_v, preds)
-                    aucs.append(auc)
-
-                mean_auc = np.mean(aucs)
-                if mean_auc > best_auc:
-                    best_auc = mean_auc
-                    best_name = name
-            except Exception:
-                continue
-
-        # En iyi dönüşümü uygula
-        final_transform = candidates[best_name]
-        new_col_name = f"{col}_transformed_{best_name}"
-
-        X_train_new[new_col_name] = final_transform
-
-        # Orijinali koru
-        if keep_original:
-            X_train_new[col] = X_train[col]
-
-        # Val ve test'e aynı dönüşüm
-        try:
-            if best_name == 'original':
-                X_val_new[new_col_name] = X_val[col]
-                X_test_new[new_col_name] = X_test[col]
-
-            elif best_name == 'winsorized':
-                X_val_new[new_col_name] = winsorize(X_val[col], limits=[0.01, 0.01])
-                X_test_new[new_col_name] = winsorize(X_test[col], limits=[0.01, 0.01])
-
-            elif best_name == 'quantile_target_encoded':
-                val_binned = kbin_q.transform(X_val[col].values.reshape(-1, 1)).astype(int).flatten()
-                test_binned = kbin_q.transform(X_test[col].values.reshape(-1, 1)).astype(int).flatten()
-                X_val_new[new_col_name] = [bin_ratios_q.get(b, 0) for b in val_binned]
-                X_test_new[new_col_name] = [bin_ratios_q.get(b, 0) for b in test_binned]
-
-            elif best_name == 'uniform_target_encoded':
-                val_binned = kbin_u.transform(X_val[col].values.reshape(-1, 1)).astype(int).flatten()
-                test_binned = kbin_u.transform(X_test[col].values.reshape(-1, 1)).astype(int).flatten()
-                X_val_new[new_col_name] = [bin_ratios_u.get(b, 0) for b in val_binned]
-                X_test_new[new_col_name] = [bin_ratios_u.get(b, 0) for b in test_binned]
-
-            elif best_name == 'categoric_target_encoded':
-                val_encoded = [cat_ratios.get(v, 0) for v in X_val[col]]
-                test_encoded = [cat_ratios.get(v, 0) for v in X_test[col]]
-                X_val_new[new_col_name] = val_encoded
-                X_test_new[new_col_name] = test_encoded
-
-        except Exception:
-            X_val_new[new_col_name] = 0
-            X_test_new[new_col_name] = 0
-
-        summary.append({
-            'feature': col,
-            'unique_vals': unique_values,
-            'categoric_like': is_categoric_like,
-            'best_transformation': best_name,
-            'cv_auc': best_auc
-        })
-
-    summary_df = pd.DataFrame(summary)
-    return X_train_new, X_val_new, X_test_new, summary_df
-
-X_train_new, X_val_new, X_test_new, summary_df = transform_numerics_targetwise_v2(
-    X_train, y_train, X_val, X_test,
-    model_params={'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.1},
-    keep_original=True
-)
+    group_log_df = pd.DataFrame(group_log)
+    return X_train_new, X_val_new, X_test_new, group_log_df
