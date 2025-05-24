@@ -7,22 +7,23 @@ from scipy.stats.mstats import winsorize
 from sklearn.preprocessing import KBinsDiscretizer
 
 
-def target_aware_transform(X_train, y_train, X_val, X_test, model_params=None, numerical_cols=None, keep_original=True, n_bins=5):
+def transform_numerics_targetwise_v2(X_train, y_train, X_val, X_test,
+                                     model_params=None,
+                                     numerical_cols=None,
+                                     categoric_detection_threshold=5,
+                                     keep_original=True,
+                                     n_bins=5):
     """
-    Target-aware dönüşüm: her numerik feature için en iyi target bazlı dönüşümü belirler ve uygular.
-    Sadece X_train kullanılarak dönüşüm belirlenir, X_val ve X_test'e aynı dönüşüm uygulanır.
-
-    Params:
-        X_train, y_train: Train dataset
-        X_val, X_test: Val ve test (sadece dönüşüm uygulanır)
-        model_params: XGBoost parametreleri
-        numerical_cols: Sadece bu kolonlar üzerinde dönüşüm yapılır
-        keep_original: Orijinal feature da saklansın mı
-        n_bins: Binning için kaç grup oluşturulsun
+    Akıllı target-aware dönüşüm fonksiyonu (v2):
+    - Numerik feature'lar otomatik olarak incelenir
+    - Kategorik gibi davranan feature'lar (az unique değerli) hem numerik hem kategorik olarak işlenir
+    - Her dönüşüm XGB ile AUC bazında değerlendirilir
+    - En iyi dönüşüm seçilir ve sadece train bazında karar verilir
+    - Aynı dönüşüm val ve test'e uygulanır
+    - Orijinal feature korunur (keep_original=True)
 
     Returns:
-        X_train_new, X_val_new, X_test_new: dönüştürülmüş datasetler
-        summary_df: her feature için dönüşüm özeti
+        Transformed X_train, X_val, X_test ve dönüşüm özet tablosu
     """
     if model_params is None:
         model_params = {
@@ -50,37 +51,50 @@ def target_aware_transform(X_train, y_train, X_val, X_test, model_params=None, n
 
         candidates = {}
 
-        # 1. Orijinal feature
+        # Orijinal feature
         candidates['original'] = col_data.values
 
-        # 2. Winsorized
+        # Winsorized
         try:
             capped = winsorize(col_data, limits=[0.01, 0.01])
             candidates['winsorized'] = capped
         except Exception:
             pass
 
-        # 3. Quantile binning + target ratio encoding
+        # Detect if feature is categoric-like
+        unique_values = col_data.nunique()
+        is_categoric_like = unique_values <= categoric_detection_threshold
+
+        # Quantile binning + target encoding
         try:
             kbin_q = KBinsDiscretizer(n_bins=n_bins, encode='ordinal', strategy='quantile')
             binned_q = kbin_q.fit_transform(col_data.values.reshape(-1, 1)).astype(int).flatten()
-            bin_ratios_q = pd.Series(binned_q).groupby(binned_q).apply(lambda b: y_data[b.index].mean())
-            encoded_q = [bin_ratios_q[b] if b in bin_ratios_q else 0 for b in binned_q]
+            bin_ratios_q = pd.DataFrame({'bin': binned_q, 'target': y_data}).groupby('bin')['target'].mean()
+            encoded_q = [bin_ratios_q.get(b, 0) for b in binned_q]
             candidates['quantile_target_encoded'] = encoded_q
         except Exception:
             pass
 
-        # 4. Uniform binning + target ratio encoding
+        # Uniform binning + target encoding
         try:
             kbin_u = KBinsDiscretizer(n_bins=n_bins, encode='ordinal', strategy='uniform')
             binned_u = kbin_u.fit_transform(col_data.values.reshape(-1, 1)).astype(int).flatten()
-            bin_ratios_u = pd.Series(binned_u).groupby(binned_u).apply(lambda b: y_data[b.index].mean())
-            encoded_u = [bin_ratios_u[b] if b in bin_ratios_u else 0 for b in binned_u]
+            bin_ratios_u = pd.DataFrame({'bin': binned_u, 'target': y_data}).groupby('bin')['target'].mean()
+            encoded_u = [bin_ratios_u.get(b, 0) for b in binned_u]
             candidates['uniform_target_encoded'] = encoded_u
         except Exception:
             pass
 
-        # Her dönüşüm için AUC değerlendirmesi
+        # Categorical-like: direct target mean encoding
+        if is_categoric_like:
+            try:
+                cat_ratios = col_data.groupby(col_data).apply(lambda x: y_data[x.index].mean())
+                encoded_cat = [cat_ratios.get(v, 0) for v in col_data]
+                candidates['categoric_target_encoded'] = encoded_cat
+            except Exception:
+                pass
+
+        # Her dönüşüm için AUC karşılaştırması
         best_auc = -1
         best_name = None
         for name, transformed_feature in candidates.items():
@@ -106,37 +120,50 @@ def target_aware_transform(X_train, y_train, X_val, X_test, model_params=None, n
 
         # En iyi dönüşümü uygula
         final_transform = candidates[best_name]
-        new_col_name = f"{col}_transformed"
+        new_col_name = f"{col}_transformed_{best_name}"
 
         X_train_new[new_col_name] = final_transform
+
+        # Orijinali koru
         if keep_original:
             X_train_new[col] = X_train[col]
 
-        # Aynı dönüşüm objesini val ve test'e uygula
-        if best_name == 'original':
-            X_val_new[new_col_name] = X_val[col]
-            X_test_new[new_col_name] = X_test[col]
+        # Val ve test'e aynı dönüşüm
+        try:
+            if best_name == 'original':
+                X_val_new[new_col_name] = X_val[col]
+                X_test_new[new_col_name] = X_test[col]
 
-        elif best_name == 'winsorized':
-            val_capped = winsorize(X_val[col], limits=[0.01, 0.01])
-            test_capped = winsorize(X_test[col], limits=[0.01, 0.01])
-            X_val_new[new_col_name] = val_capped
-            X_test_new[new_col_name] = test_capped
+            elif best_name == 'winsorized':
+                X_val_new[new_col_name] = winsorize(X_val[col], limits=[0.01, 0.01])
+                X_test_new[new_col_name] = winsorize(X_test[col], limits=[0.01, 0.01])
 
-        elif best_name == 'quantile_target_encoded':
-            val_binned = kbin_q.transform(X_val[col].values.reshape(-1, 1)).astype(int).flatten()
-            test_binned = kbin_q.transform(X_test[col].values.reshape(-1, 1)).astype(int).flatten()
-            X_val_new[new_col_name] = [bin_ratios_q.get(b, 0) for b in val_binned]
-            X_test_new[new_col_name] = [bin_ratios_q.get(b, 0) for b in test_binned]
+            elif best_name == 'quantile_target_encoded':
+                val_binned = kbin_q.transform(X_val[col].values.reshape(-1, 1)).astype(int).flatten()
+                test_binned = kbin_q.transform(X_test[col].values.reshape(-1, 1)).astype(int).flatten()
+                X_val_new[new_col_name] = [bin_ratios_q.get(b, 0) for b in val_binned]
+                X_test_new[new_col_name] = [bin_ratios_q.get(b, 0) for b in test_binned]
 
-        elif best_name == 'uniform_target_encoded':
-            val_binned = kbin_u.transform(X_val[col].values.reshape(-1, 1)).astype(int).flatten()
-            test_binned = kbin_u.transform(X_test[col].values.reshape(-1, 1)).astype(int).flatten()
-            X_val_new[new_col_name] = [bin_ratios_u.get(b, 0) for b in val_binned]
-            X_test_new[new_col_name] = [bin_ratios_u.get(b, 0) for b in test_binned]
+            elif best_name == 'uniform_target_encoded':
+                val_binned = kbin_u.transform(X_val[col].values.reshape(-1, 1)).astype(int).flatten()
+                test_binned = kbin_u.transform(X_test[col].values.reshape(-1, 1)).astype(int).flatten()
+                X_val_new[new_col_name] = [bin_ratios_u.get(b, 0) for b in val_binned]
+                X_test_new[new_col_name] = [bin_ratios_u.get(b, 0) for b in test_binned]
+
+            elif best_name == 'categoric_target_encoded':
+                val_encoded = [cat_ratios.get(v, 0) for v in X_val[col]]
+                test_encoded = [cat_ratios.get(v, 0) for v in X_test[col]]
+                X_val_new[new_col_name] = val_encoded
+                X_test_new[new_col_name] = test_encoded
+
+        except Exception:
+            X_val_new[new_col_name] = 0
+            X_test_new[new_col_name] = 0
 
         summary.append({
             'feature': col,
+            'unique_vals': unique_values,
+            'categoric_like': is_categoric_like,
             'best_transformation': best_name,
             'cv_auc': best_auc
         })
