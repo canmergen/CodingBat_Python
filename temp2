@@ -1,19 +1,22 @@
+import pandas as pd
+import numpy as np
 from scipy.stats import spearmanr
 
-def transform_monotonic_categoricals(X_train, y_train, X_val, X_test,
-                                      numerical_cols=None,
-                                      min_group_size=50,
-                                      ratio_jump_threshold=0.05,
-                                      keep_original=True,
-                                      monotonicity_threshold=0.8):
+def transform_monotonic_categoricals_relaxed(X_train, y_train, X_val, X_test,
+                                              numerical_cols=None,
+                                              min_group_size=30,
+                                              ratio_jump_threshold=0.03,
+                                              min_group_proportion=0.03,
+                                              keep_original=True,
+                                              monotonicity_threshold=0.7):
     """
-    Numerik gibi görünen ama aslında target bazlı kategorik segmentlere bölünmesi gereken feature'ları
-    target oranı benzerliğine göre gruplar ve sadece monotonik olanları dönüştürür.
+    Gruplamayı daha esnek yapar, target oranına göre segmentler oluşturur.
+    Monotoniclik zayıf ama yeterliyse feature üretir. Grup dağılımları kontrol edilir.
 
     Returns:
         X_train_new, X_val_new, X_test_new, group_log_df, used_features
     """
-    def bin_and_check_monotonicity(feature_series, target_series):
+    def relaxed_bin_and_check_monotonicity(feature_series, target_series):
         stats = (
             pd.DataFrame({'value': feature_series, 'target': target_series})
             .groupby('value')
@@ -22,6 +25,7 @@ def transform_monotonic_categoricals(X_train, y_train, X_val, X_test,
             .reset_index()
         )
 
+        total_len = len(feature_series)
         group_ids = []
         current_group = 0
         group_start_idx = 0
@@ -40,14 +44,17 @@ def transform_monotonic_categoricals(X_train, y_train, X_val, X_test,
         group_ids.extend([current_group] * (len(stats) - len(group_ids)))
         stats['group'] = group_ids
 
+        # Grup dağılımı kontrolü
+        group_distribution = stats.groupby('group')['count'].sum() / total_len
+        if any(group_distribution < min_group_proportion) or len(group_distribution) <= 1:
+            return None, None, 0
+
         # Monotonicity kontrolü
         group_target_means = stats.groupby('group')['target_ratio'].mean().values
-        if len(group_target_means) <= 1:
-            return None, None, 0  # Tek grup varsa anlamlı değil
-
         spearman_corr, _ = spearmanr(range(len(group_target_means)), group_target_means)
+
         if np.abs(spearman_corr) < monotonicity_threshold:
-            return None, None, spearman_corr  # Monotonic değilse boş döneriz
+            return None, None, spearman_corr
 
         group_map = stats.set_index('value')['group'].to_dict()
         grouped_feature = feature_series.map(group_map).fillna(-1).astype(int)
@@ -76,7 +83,7 @@ def transform_monotonic_categoricals(X_train, y_train, X_val, X_test,
 
     for col in numerical_cols:
         try:
-            grouped_train, group_defs, spearman_corr = bin_and_check_monotonicity(X_train[col], y_train)
+            grouped_train, group_defs, spearman_corr = relaxed_bin_and_check_monotonicity(X_train[col], y_train)
 
             if grouped_train is not None:
                 new_col_name = f"{col}_transformed_grouped"
