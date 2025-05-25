@@ -1,13 +1,19 @@
-import pandas as pd
-import numpy as np
 from scipy.stats import spearmanr
 
-def transform_numerics_targetwise_monotonic(X_train, y_train, X_val, X_test,
-                                            numerical_cols=None,
-                                            min_group_size=50,
-                                            ratio_jump_threshold=0.05,
-                                            keep_original=True):
-    def target_ratio_monotonic_grouping(feature_series, target_series, min_group_size=50, ratio_jump_threshold=0.05):
+def transform_monotonic_categoricals(X_train, y_train, X_val, X_test,
+                                      numerical_cols=None,
+                                      min_group_size=50,
+                                      ratio_jump_threshold=0.05,
+                                      keep_original=True,
+                                      monotonicity_threshold=0.8):
+    """
+    Numerik gibi görünen ama aslında target bazlı kategorik segmentlere bölünmesi gereken feature'ları
+    target oranı benzerliğine göre gruplar ve sadece monotonik olanları dönüştürür.
+
+    Returns:
+        X_train_new, X_val_new, X_test_new, group_log_df, used_features
+    """
+    def bin_and_check_monotonicity(feature_series, target_series):
         stats = (
             pd.DataFrame({'value': feature_series, 'target': target_series})
             .groupby('value')
@@ -20,30 +26,28 @@ def transform_numerics_targetwise_monotonic(X_train, y_train, X_val, X_test,
         current_group = 0
         group_start_idx = 0
         last_ratio = stats.loc[0, 'target_ratio']
-        direction = None
 
         for i in range(1, len(stats)):
             current_ratio = stats.loc[i, 'target_ratio']
             total_count = stats.loc[group_start_idx:i, 'count'].sum()
-            jump = current_ratio - last_ratio
 
-            if direction is None:
-                direction = np.sign(jump)
-
-            if (
-                np.sign(jump) == direction and
-                abs(jump) >= ratio_jump_threshold and
-                total_count >= min_group_size
-            ):
+            if abs(current_ratio - last_ratio) >= ratio_jump_threshold and total_count >= min_group_size:
                 group_ids.extend([current_group] * (i - group_start_idx))
                 current_group += 1
                 group_start_idx = i
                 last_ratio = current_ratio
-            else:
-                last_ratio = (stats.loc[group_start_idx:i, 'target_ratio'] * stats.loc[group_start_idx:i, 'count']).sum() / stats.loc[group_start_idx:i, 'count'].sum()
 
         group_ids.extend([current_group] * (len(stats) - len(group_ids)))
         stats['group'] = group_ids
+
+        # Monotonicity kontrolü
+        group_target_means = stats.groupby('group')['target_ratio'].mean().values
+        if len(group_target_means) <= 1:
+            return None, None, 0  # Tek grup varsa anlamlı değil
+
+        spearman_corr, _ = spearmanr(range(len(group_target_means)), group_target_means)
+        if np.abs(spearman_corr) < monotonicity_threshold:
+            return None, None, spearman_corr  # Monotonic değilse boş döneriz
 
         group_map = stats.set_index('value')['group'].to_dict()
         grouped_feature = feature_series.map(group_map).fillna(-1).astype(int)
@@ -59,7 +63,7 @@ def transform_numerics_targetwise_monotonic(X_train, y_train, X_val, X_test,
                 'target_ratio_avg': round(target_avg, 4)
             })
 
-        return grouped_feature, group_defs
+        return grouped_feature, group_defs, spearman_corr
 
     if numerical_cols is None:
         numerical_cols = X_train.select_dtypes(include=np.number).columns.tolist()
@@ -68,37 +72,39 @@ def transform_numerics_targetwise_monotonic(X_train, y_train, X_val, X_test,
     X_val_new = X_val.copy()
     X_test_new = X_test.copy()
     group_log = []
+    used_features = []
 
     for col in numerical_cols:
         try:
-            grouped_train, group_defs = target_ratio_monotonic_grouping(
-                X_train[col], y_train,
-                min_group_size=min_group_size,
-                ratio_jump_threshold=ratio_jump_threshold
-            )
-            new_col_name = f"{col}_transformed_grouped"
-            X_train_new[new_col_name] = grouped_train
-            X_val_new[new_col_name] = X_val[col].map(grouped_train.drop_duplicates()).fillna(-1).astype(int)
-            X_test_new[new_col_name] = X_test[col].map(grouped_train.drop_duplicates()).fillna(-1).astype(int)
+            grouped_train, group_defs, spearman_corr = bin_and_check_monotonicity(X_train[col], y_train)
 
-            for g in group_defs:
-                group_log.append({
-                    'feature': col,
-                    'new_feature': new_col_name,
-                    'group_id': g['group_id'],
-                    'value_range_start': g['value_range'][0],
-                    'value_range_end': g['value_range'][1],
-                    'target_ratio_avg': g['target_ratio_avg'],
-                    'value_list': g['values']
-                })
+            if grouped_train is not None:
+                new_col_name = f"{col}_transformed_grouped"
+                X_train_new[new_col_name] = grouped_train
+                X_val_new[new_col_name] = X_val[col].map(grouped_train.drop_duplicates()).fillna(-1).astype(int)
+                X_test_new[new_col_name] = X_test[col].map(grouped_train.drop_duplicates()).fillna(-1).astype(int)
 
-            if keep_original:
-                X_train_new[col] = X_train[col]
-                X_val_new[col] = X_val[col]
-                X_test_new[col] = X_test[col]
+                for g in group_defs:
+                    group_log.append({
+                        'feature': col,
+                        'new_feature': new_col_name,
+                        'group_id': g['group_id'],
+                        'value_range_start': g['value_range'][0],
+                        'value_range_end': g['value_range'][1],
+                        'target_ratio_avg': g['target_ratio_avg'],
+                        'value_list': g['values'],
+                        'spearman_corr': round(spearman_corr, 4)
+                    })
+
+                used_features.append(new_col_name)
+
+                if keep_original:
+                    X_train_new[col] = X_train[col]
+                    X_val_new[col] = X_val[col]
+                    X_test_new[col] = X_test[col]
 
         except Exception as e:
             print(f"{col} için gruplayamadık: {e}")
 
     group_log_df = pd.DataFrame(group_log)
-    return X_train_new, X_val_new, X_test_new, group_log_df
+    return X_train_new, X_val_new, X_test_new, group_log_df, used_features
