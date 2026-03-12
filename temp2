@@ -1,117 +1,222 @@
-import pandas as pd
-import numpy as np
-from scipy.stats import spearmanr
+WITH
 
-def transform_monotonic_categoricals_relaxed(X_train, y_train, X_val, X_test,
-                                              numerical_cols=None,
-                                              min_group_size=30,
-                                              ratio_jump_threshold=0.03,
-                                              min_group_proportion=0.03,
-                                              keep_original=True,
-                                              monotonicity_threshold=0.7):
-    """
-    Gruplamayı daha esnek yapar, target oranına göre segmentler oluşturur.
-    Monotoniclik zayıf ama yeterliyse feature üretir. Grup dağılımları kontrol edilir.
+/* Adım 1: Her iki tarih için TH bakiyeleri (TH_YENI_ yerine) */
+CTE_TH_BAKIYE AS (
+    SELECT
+        RAPOR_TARIHI,
+        MUSTERI_NO,
+        PARA_KODU,
+        SUM(VADELI_BAKIYE) + SUM(VADESIZ_BAKIYE) AS TOTAL_TH_BAKIYE
+    FROM PRSN.TURUNCU_YENI
+    WHERE RAPOR_TARIHI IN (
+        TIMESTAMP '2026-01-20 00:00:00',
+        TIMESTAMP '2026-01-19 00:00:00'
+    )
+    AND CALISMA_SEKLI = 1
+    GROUP BY RAPOR_TARIHI, MUSTERI_NO, PARA_KODU
+),
 
-    Returns:
-        X_train_new, X_val_new, X_test_new, group_log_df, used_features
-    """
-    def relaxed_bin_and_check_monotonicity(feature_series, target_series):
-        stats = (
-            pd.DataFrame({'value': feature_series, 'target': target_series})
-            .groupby('value')
-            .agg(count=('target', 'count'), target_ratio=('target', 'mean'))
-            .sort_index()
-            .reset_index()
-        )
+/* Adım 2: T-1 bakiye 20/01/2026 — TL (TL_ETH_TH_1 yerine) */
+CTE_T_EKSI1 AS (
+    SELECT base.MUSTERI_NO,
+           SUM(th.TOTAL_TH_BAKIYE) AS T_EKSI1_BAKIYE
+    FROM (
+        SELECT RAPOR_TARIHI, MUSTERI_NO, PARA_KODU AS PARA
+        FROM PRSN.TURUNCU_YENI
+        WHERE CALISMA_SEKLI = 1
+          AND RAPOR_TARIHI  = TIMESTAMP '2026-01-20 00:00:00'
+          AND VADELI_BAKIYE > 0
+        GROUP BY RAPOR_TARIHI, MUSTERI_NO, PARA_KODU
+    ) base
+    LEFT JOIN CTE_TH_BAKIYE th
+        ON  base.MUSTERI_NO   = th.MUSTERI_NO
+        AND base.PARA         = th.PARA_KODU
+        AND base.RAPOR_TARIHI = th.RAPOR_TARIHI
+    WHERE base.PARA = 0
+    GROUP BY base.MUSTERI_NO
+),
 
-        total_len = len(feature_series)
-        group_ids = []
-        current_group = 0
-        group_start_idx = 0
-        last_ratio = stats.loc[0, 'target_ratio']
+/* Adım 3: T-2 bakiye 19/01/2026 — TL (TL_ETH_TH_2 yerine) */
+CTE_T_EKSI2 AS (
+    SELECT base.MUSTERI_NO,
+           SUM(th.TOTAL_TH_BAKIYE) AS T_EKSI2_BAKIYE
+    FROM (
+        SELECT RAPOR_TARIHI, MUSTERI_NO, PARA_KODU AS PARA
+        FROM PRSN.TURUNCU_YENI
+        WHERE CALISMA_SEKLI = 1
+          AND RAPOR_TARIHI  = TIMESTAMP '2026-01-19 00:00:00'
+          AND VADELI_BAKIYE > 0
+        GROUP BY RAPOR_TARIHI, MUSTERI_NO, PARA_KODU
+    ) base
+    LEFT JOIN CTE_TH_BAKIYE th
+        ON  base.MUSTERI_NO   = th.MUSTERI_NO
+        AND base.PARA         = th.PARA_KODU
+        AND base.RAPOR_TARIHI = th.RAPOR_TARIHI
+    WHERE base.PARA = 0
+    GROUP BY base.MUSTERI_NO
+),
 
-        for i in range(1, len(stats)):
-            current_ratio = stats.loc[i, 'target_ratio']
-            total_count = stats.loc[group_start_idx:i, 'count'].sum()
+/* Adım 4: Müşteri evreni */
+CTE_MUSTERILER AS (
+    SELECT DISTINCT MUSTERI_NO
+    FROM PRSN.TURUNCU_YENI
+    WHERE CALISMA_SEKLI = 1
+      AND RAPOR_TARIHI IN (
+          TO_DATE('20/01/2026', 'DD/MM/YYYY'),
+          TO_DATE('19/01/2026', 'DD/MM/YYYY')
+      )
+),
 
-            if abs(current_ratio - last_ratio) >= ratio_jump_threshold and total_count >= min_group_size:
-                group_ids.extend([current_group] * (i - group_start_idx))
-                current_group += 1
-                group_start_idx = i
-                last_ratio = current_ratio
+/* Adım 5: Ana flow hesabı (TL_ETH_TH_FLOW_DATASI yerine) */
+CTE_FLOW AS (
+    SELECT DISTINCT
+        m.MUSTERI_NO,
+        t1.T_EKSI1_BAKIYE,
+        t2.T_EKSI2_BAKIYE,
 
-        group_ids.extend([current_group] * (len(stats) - len(group_ids)))
-        stats['group'] = group_ids
+        /* T_EKSI1_BRACKET */
+        CASE
+            WHEN t1.T_EKSI1_BAKIYE <= 0 OR t1.T_EKSI1_BAKIYE IS NULL THEN '00:0K'
+            WHEN t1.T_EKSI1_BAKIYE < 10000    THEN '01:0K-10K'
+            WHEN t1.T_EKSI1_BAKIYE < 25000    THEN '02:10K-25K'
+            WHEN t1.T_EKSI1_BAKIYE < 50000    THEN '03:25K-50K'
+            WHEN t1.T_EKSI1_BAKIYE < 75000    THEN '04:50K-75K'
+            WHEN t1.T_EKSI1_BAKIYE < 100000   THEN '05:75K-100K'
+            WHEN t1.T_EKSI1_BAKIYE < 150000   THEN '06:100K-150K'
+            WHEN t1.T_EKSI1_BAKIYE < 250000   THEN '07:150K-250K'
+            WHEN t1.T_EKSI1_BAKIYE < 500000   THEN '08:250K-500K'
+            WHEN t1.T_EKSI1_BAKIYE < 750000   THEN '09:500K-750K'
+            WHEN t1.T_EKSI1_BAKIYE < 1000000  THEN '10:750K-1M'
+            WHEN t1.T_EKSI1_BAKIYE < 2000000  THEN '11:1M-2M'
+            WHEN t1.T_EKSI1_BAKIYE < 5000000  THEN '12:2M-5M'
+            WHEN t1.T_EKSI1_BAKIYE < 7500000  THEN '13:5M-7.5M'
+            WHEN t1.T_EKSI1_BAKIYE < 10000000 THEN '14:7.5M-10M'
+            WHEN t1.T_EKSI1_BAKIYE < 15000000 THEN '15:10M-15M'
+            WHEN t1.T_EKSI1_BAKIYE < 25000000 THEN '16:15M-25M'
+            WHEN t1.T_EKSI1_BAKIYE < 35000000 THEN '17:25M-35M'
+            ELSE '18:35M+'
+        END AS T_EKSI1_BRACKET,
 
-        # Grup dağılımı kontrolü
-        group_distribution = stats.groupby('group')['count'].sum() / total_len
-        if any(group_distribution < min_group_proportion) or len(group_distribution) <= 1:
-            return None, None, 0
+        /* T_EKSI2_BRACKET */
+        CASE
+            WHEN t2.T_EKSI2_BAKIYE <= 0 OR t2.T_EKSI2_BAKIYE IS NULL THEN '00:0K'
+            WHEN t2.T_EKSI2_BAKIYE < 10000    THEN '01:0K-10K'
+            WHEN t2.T_EKSI2_BAKIYE < 25000    THEN '02:10K-25K'
+            WHEN t2.T_EKSI2_BAKIYE < 50000    THEN '03:25K-50K'
+            WHEN t2.T_EKSI2_BAKIYE < 75000    THEN '04:50K-75K'
+            WHEN t2.T_EKSI2_BAKIYE < 100000   THEN '05:75K-100K'
+            WHEN t2.T_EKSI2_BAKIYE < 150000   THEN '06:100K-150K'
+            WHEN t2.T_EKSI2_BAKIYE < 250000   THEN '07:150K-250K'
+            WHEN t2.T_EKSI2_BAKIYE < 500000   THEN '08:250K-500K'
+            WHEN t2.T_EKSI2_BAKIYE < 750000   THEN '09:500K-750K'
+            WHEN t2.T_EKSI2_BAKIYE < 1000000  THEN '10:750K-1M'
+            WHEN t2.T_EKSI2_BAKIYE < 2000000  THEN '11:1M-2M'
+            WHEN t2.T_EKSI2_BAKIYE < 5000000  THEN '12:2M-5M'
+            WHEN t2.T_EKSI2_BAKIYE < 7500000  THEN '13:5M-7.5M'
+            WHEN t2.T_EKSI2_BAKIYE < 10000000 THEN '14:7.5M-10M'
+            WHEN t2.T_EKSI2_BAKIYE < 15000000 THEN '15:10M-15M'
+            WHEN t2.T_EKSI2_BAKIYE < 25000000 THEN '16:15M-25M'
+            WHEN t2.T_EKSI2_BAKIYE < 35000000 THEN '17:25M-35M'
+            ELSE '18:35M+'
+        END AS T_EKSI2_BRACKET,
 
-        # Monotonicity kontrolü
-        group_target_means = stats.groupby('group')['target_ratio'].mean().values
-        spearman_corr, _ = spearmanr(range(len(group_target_means)), group_target_means)
+        /* FARK */
+        (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+        (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) AS FARK,
 
-        if np.abs(spearman_corr) < monotonicity_threshold:
-            return None, None, spearman_corr
+        /* FARK_BRACKET */
+        CASE
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 0        THEN '000: OUTFLOW'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) = 0        THEN '00:0K'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 10000    THEN '01:0K-10K'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 25000    THEN '02:10K-25K'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 50000    THEN '03:25K-50K'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 75000    THEN '04:50K-75K'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 100000   THEN '05:75K-100K'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 150000   THEN '06:100K-150K'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 250000   THEN '07:150K-250K'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 500000   THEN '08:250K-500K'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 750000   THEN '09:500K-750K'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 1000000  THEN '10:750K-1M'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 2000000  THEN '11:1M-2M'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 5000000  THEN '12:2M-5M'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 7500000  THEN '13:5M-7.5M'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 10000000 THEN '14:7.5M-10M'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 15000000 THEN '15:10M-15M'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 25000000 THEN '16:15M-25M'
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 35000000 THEN '17:25M-35M'
+            ELSE '18:35M+'
+        END AS FARK_BRACKET,
 
-        group_map = stats.set_index('value')['group'].to_dict()
-        grouped_feature = feature_series.map(group_map).fillna(-1).astype(int)
+        /* INFLOW_OUTFLOW */
+        CASE
+            WHEN (CASE WHEN t1.T_EKSI1_BAKIYE > 0 THEN t1.T_EKSI1_BAKIYE ELSE 0 END) -
+                 (CASE WHEN t2.T_EKSI2_BAKIYE > 0 THEN t2.T_EKSI2_BAKIYE ELSE 0 END) < 0
+            THEN 'OUTFLOW'
+            ELSE 'INFLOW'
+        END AS INFLOW_OUTFLOW
 
-        group_defs = []
-        for group_id in sorted(stats['group'].unique()):
-            group_values = stats[stats['group'] == group_id]['value'].tolist()
-            target_avg = stats[stats['group'] == group_id]['target_ratio'].mean()
-            group_defs.append({
-                'group_id': group_id,
-                'value_range': (min(group_values), max(group_values)),
-                'values': group_values,
-                'target_ratio_avg': round(target_avg, 4)
-            })
+    FROM CTE_MUSTERILER m
+    LEFT JOIN CTE_T_EKSI1 t1 ON m.MUSTERI_NO = t1.MUSTERI_NO
+    LEFT JOIN CTE_T_EKSI2 t2 ON m.MUSTERI_NO = t2.MUSTERI_NO
+)
 
-        return grouped_feature, group_defs, spearman_corr
-
-    if numerical_cols is None:
-        numerical_cols = X_train.select_dtypes(include=np.number).columns.tolist()
-
-    X_train_new = X_train.copy()
-    X_val_new = X_val.copy()
-    X_test_new = X_test.copy()
-    group_log = []
-    used_features = []
-
-    for col in numerical_cols:
-        try:
-            grouped_train, group_defs, spearman_corr = relaxed_bin_and_check_monotonicity(X_train[col], y_train)
-
-            if grouped_train is not None:
-                new_col_name = f"{col}_transformed_grouped"
-                X_train_new[new_col_name] = grouped_train
-                X_val_new[new_col_name] = X_val[col].map(grouped_train.drop_duplicates()).fillna(-1).astype(int)
-                X_test_new[new_col_name] = X_test[col].map(grouped_train.drop_duplicates()).fillna(-1).astype(int)
-
-                for g in group_defs:
-                    group_log.append({
-                        'feature': col,
-                        'new_feature': new_col_name,
-                        'group_id': g['group_id'],
-                        'value_range_start': g['value_range'][0],
-                        'value_range_end': g['value_range'][1],
-                        'target_ratio_avg': g['target_ratio_avg'],
-                        'value_list': g['values'],
-                        'spearman_corr': round(spearman_corr, 4)
-                    })
-
-                used_features.append(new_col_name)
-
-                if keep_original:
-                    X_train_new[col] = X_train[col]
-                    X_val_new[col] = X_val[col]
-                    X_test_new[col] = X_test[col]
-
-        except Exception as e:
-            print(f"{col} için gruplayamadık: {e}")
-
-    group_log_df = pd.DataFrame(group_log)
-    return X_train_new, X_val_new, X_test_new, group_log_df, used_features
+/* ─── SON SORGU ─── */
+SELECT
+    q.BRACKET,
+    q.INFLOW,
+    q.OUTFLOW,
+    q.TOTAL_HACIM,
+    ABS(ROUND((SUM(q.INFLOW)  OVER () / NULLIF(SUM(q.TOTAL_HACIM) OVER (), 0) * 100), 6)) AS TOTAL_INFLOW_RATE_PERC,
+    ABS(ROUND((SUM(q.OUTFLOW) OVER () / NULLIF(SUM(q.TOTAL_HACIM) OVER (), 0) * 100), 6)) AS TOTAL_OUTFLOW_RATE_PERC
+FROM (
+    SELECT
+        COALESCE(A.BRACKET, B.BRACKET, C.BRACKET) AS BRACKET,
+        NVL(A.INFLOW,      0) AS INFLOW,
+        NVL(C.OUTFLOW,     0) AS OUTFLOW,
+        NVL(B.TOTAL_HACIM, 0) AS TOTAL_HACIM
+    FROM (
+        -- A: INFLOW: FARK_BRACKET bazında net artış
+        SELECT FARK_BRACKET  AS BRACKET, SUM(FARK)           AS INFLOW
+        FROM   CTE_FLOW
+        WHERE  INFLOW_OUTFLOW = 'INFLOW'
+          AND  FARK_BRACKET  <> '00:0K'
+        GROUP BY FARK_BRACKET
+    ) A
+    FULL OUTER JOIN (
+        -- B: TOTAL_HACIM: T-1 pozisyonu
+        SELECT T_EKSI1_BRACKET AS BRACKET, SUM(T_EKSI1_BAKIYE) AS TOTAL_HACIM
+        FROM   CTE_FLOW
+        WHERE  T_EKSI1_BRACKET <> '00:0K'
+        GROUP BY T_EKSI1_BRACKET
+    ) B ON A.BRACKET = B.BRACKET
+    FULL OUTER JOIN (
+        -- C: OUTFLOW: T-2 bracket'ından çıkan hacim
+        SELECT T_EKSI2_BRACKET AS BRACKET, SUM(FARK) AS OUTFLOW
+        FROM   CTE_FLOW
+        WHERE  INFLOW_OUTFLOW  = 'OUTFLOW'
+          AND  T_EKSI2_BRACKET <> '00:0K'
+        GROUP BY T_EKSI2_BRACKET
+    ) C ON COALESCE(A.BRACKET, B.BRACKET) = C.BRACKET
+    WHERE COALESCE(A.BRACKET, B.BRACKET, C.BRACKET) <> '00:0K'
+) q
+ORDER BY q.BRACKET;
