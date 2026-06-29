@@ -84,7 +84,7 @@ CTE_TL_BAKIYE AS (
 /* -- EKSTRA musteri-gun kayitlari: kampanya orani standart osawelcome'dan FAZLA
    (o tarihte gecerli standart welcome ile kiyas). Bunlar netflow'dan cikarilacak. -- */
 CTE_EXTRA AS (
-    SELECT DISTINCT
+    SELECT /*+ MATERIALIZE */ DISTINCT
         b.RAPOR_TARIHI,
         b.MUSTERI_NO
     FROM CTE_TL_BAKIYE b
@@ -231,7 +231,13 @@ CTE_FLOW AS (
         SELECT 1
         FROM CTE_EXTRA e
         WHERE e.MUSTERI_NO   = rp.MUSTERI_NO
-          AND e.RAPOR_TARIHI IN (rp.D_EKSI1, rp.D_EKSI2)
+          AND e.RAPOR_TARIHI = rp.D_EKSI1
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM CTE_EXTRA e
+        WHERE e.MUSTERI_NO   = rp.MUSTERI_NO
+          AND e.RAPOR_TARIHI = rp.D_EKSI2
     )
 ),
 
