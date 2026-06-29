@@ -205,3 +205,4 @@ SELECT
     a.kampanyali_hacim   - LAG(a.kampanyali_hacim)   OVER (ORDER BY a.HAFTA_MIN) AS kampanyali_hacim_degisim
 FROM wk_all a
 ORDER BY a.HAFTA_MIN;
+
