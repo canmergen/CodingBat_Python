@@ -27,14 +27,16 @@ osa_welcome AS (
 snap AS (
     SELECT /*+ MATERIALIZE */
         HAFTA_MIN, MUSTERI_NO, KAMPANYA_ADI,
-        BONUS_BIT_TARIHI, KAMPANYA_BIT_TARIHI, KAMPANYA_FAIZ_ORANI
+        BONUS_BIT_TARIHI, KAMPANYA_BAS_TARIHI, KAMPANYA_BIT_TARIHI, KAMPANYA_FAIZ_ORANI, TH_TOTAL_BAKIYE
     FROM (
         SELECT /*+ PARALLEL(t, 4) */
             t.MUSTERI_NO,
             t.KAMPANYA_ADI,
             t.BONUS_BIT_TARIHI,
+            t.KAMPANYA_BAS_TARIHI,
             t.KAMPANYA_BIT_TARIHI,
             t.KAMPANYA_FAIZ_ORANI,
+            t.TH_TOTAL_BAKIYE,
             t.RAPOR_TARIHI,
             t.RAPOR_TARIHI - MOD(t.RAPOR_TARIHI - DATE '2024-09-16', 7) AS HAFTA_MIN,
             MAX(t.RAPOR_TARIHI) OVER (
@@ -56,8 +58,10 @@ cust_week AS (
         MAX(CASE WHEN KAMPANYA_ADI IS NOT NULL THEN 1 ELSE 0 END) AS KAMPANYALI,
         MAX(KAMPANYA_FAIZ_ORANI)                                  AS KAMPANYA_FAIZ_ORANI,
         MAX(BONUS_BIT_TARIHI)                                     AS BONUS_BIT_TARIHI,
+        MAX(KAMPANYA_BAS_TARIHI)                                  AS KAMPANYA_BAS_TARIHI,
         MAX(KAMPANYA_BIT_TARIHI)                                  AS KAMPANYA_BIT_TARIHI,
-        MAX(KAMPANYA_ADI)                                         AS KAMPANYA_ADI
+        MAX(KAMPANYA_ADI)                                         AS KAMPANYA_ADI,
+        SUM(TH_TOTAL_BAKIYE)                                      AS MUSTERI_HACIM
     FROM snap
     GROUP BY HAFTA_MIN, MUSTERI_NO
 ),
@@ -71,7 +75,8 @@ wk_welcome AS (
 cw AS (
     SELECT
         c.HAFTA_MIN, c.MUSTERI_NO, c.KAMPANYALI, c.KAMPANYA_ADI,
-        c.BONUS_BIT_TARIHI, c.KAMPANYA_BIT_TARIHI,
+        c.BONUS_BIT_TARIHI, c.KAMPANYA_BAS_TARIHI, c.KAMPANYA_BIT_TARIHI, c.MUSTERI_HACIM,
+        c.KAMPANYA_FAIZ_ORANI, v.OSAWelcome,
         CASE WHEN c.KAMPANYA_FAIZ_ORANI > v.OSAWelcome + 0.0001 THEN 1 ELSE 0 END AS WELCOME_USTU
     FROM cust_week c
     LEFT JOIN wk_welcome v ON c.HAFTA_MIN = v.HAFTA_MIN
@@ -85,6 +90,10 @@ wk_all AS (
         SUM(1 - KAMPANYALI)            AS baseline_musteri,
         COUNT(DISTINCT KAMPANYA_ADI)   AS farkli_kampanya_sayisi,
         SUM(WELCOME_USTU)              AS welcome_ustu_musteri,
+        SUM(MUSTERI_HACIM)                            AS toplam_hacim,
+        SUM(CASE WHEN KAMPANYALI = 1 THEN MUSTERI_HACIM ELSE 0 END) AS kampanyali_hacim,
+        SUM(CASE WHEN KAMPANYALI = 0 THEN MUSTERI_HACIM ELSE 0 END) AS baseline_hacim,
+        SUM(CASE WHEN WELCOME_USTU = 1 THEN MUSTERI_HACIM ELSE 0 END) AS welcome_ustu_hacim,
         SUM(CASE WHEN KAMPANYALI = 0
                   AND BONUS_BIT_TARIHI >= HAFTA_MIN     AND BONUS_BIT_TARIHI < HAFTA_MIN + 7
                  THEN 1 ELSE 0 END)    AS welcome_bitiyor_bu_hafta,
@@ -92,41 +101,107 @@ wk_all AS (
                   AND BONUS_BIT_TARIHI >= HAFTA_MIN + 7 AND BONUS_BIT_TARIHI < HAFTA_MIN + 14
                  THEN 1 ELSE 0 END)    AS welcome_bitiyor_gelecek_hafta,
         SUM(CASE WHEN KAMPANYALI = 1
-                  AND KAMPANYA_BIT_TARIHI >= HAFTA_MIN     AND KAMPANYA_BIT_TARIHI < HAFTA_MIN + 7
-                 THEN 1 ELSE 0 END)    AS kampanya_bitiyor_bu_hafta,
-        SUM(CASE WHEN KAMPANYALI = 1
                   AND KAMPANYA_BIT_TARIHI >= HAFTA_MIN + 7 AND KAMPANYA_BIT_TARIHI < HAFTA_MIN + 14
-                 THEN 1 ELSE 0 END)    AS kampanya_bitiyor_gelecek_hafta
+                 THEN 1 ELSE 0 END)    AS kampanya_bitiyor_gelecek_hafta,
+        /* bitis HACIMLERI (TL bazinda bitis baskisi) */
+        SUM(CASE WHEN KAMPANYALI = 0 AND BONUS_BIT_TARIHI >= HAFTA_MIN     AND BONUS_BIT_TARIHI < HAFTA_MIN + 7
+                 THEN MUSTERI_HACIM ELSE 0 END) AS welcome_bitiyor_bu_hafta_hacim,
+        SUM(CASE WHEN KAMPANYALI = 0 AND BONUS_BIT_TARIHI >= HAFTA_MIN + 7 AND BONUS_BIT_TARIHI < HAFTA_MIN + 14
+                 THEN MUSTERI_HACIM ELSE 0 END) AS welcome_bitiyor_gelecek_hafta_hacim,
+        SUM(CASE WHEN KAMPANYALI = 1 AND KAMPANYA_BIT_TARIHI >= HAFTA_MIN + 7 AND KAMPANYA_BIT_TARIHI < HAFTA_MIN + 14
+                 THEN MUSTERI_HACIM ELSE 0 END) AS kampanya_bitiyor_gelecek_hafta_hacim,
+        /* kampanya BASLIYOR (bu hafta basladi; snapshot'ta aktif oldugu icin kayipsiz) */
+        SUM(CASE WHEN KAMPANYALI = 1 AND KAMPANYA_BAS_TARIHI >= HAFTA_MIN AND KAMPANYA_BAS_TARIHI < HAFTA_MIN + 7
+                 THEN 1 ELSE 0 END)            AS kampanya_basliyor_bu_hafta,
+        SUM(CASE WHEN KAMPANYALI = 1 AND KAMPANYA_BAS_TARIHI >= HAFTA_MIN AND KAMPANYA_BAS_TARIHI < HAFTA_MIN + 7
+                 THEN MUSTERI_HACIM ELSE 0 END) AS kampanya_basliyor_bu_hafta_hacim,
+        /* kampanya rate ortalamasi + welcome primi (sadece kampanyalilarda) */
+        ROUND(AVG(CASE WHEN KAMPANYALI = 1 THEN KAMPANYA_FAIZ_ORANI END), 2)             AS ort_kampanya_rate,
+        ROUND(AVG(CASE WHEN KAMPANYALI = 1 THEN KAMPANYA_FAIZ_ORANI - OSAWelcome END), 2) AS kampanya_primi
     FROM cw
     GROUP BY HAFTA_MIN
-),
-/* 6) o haftanin en cok musterili kampanyasi */
-wk_top AS (
-    SELECT HAFTA_MIN,
-           MAX(KAMPANYA_ADI) KEEP (DENSE_RANK LAST ORDER BY cnt, KAMPANYA_ADI) AS en_buyuk_kampanya,
-           MAX(cnt)          KEEP (DENSE_RANK LAST ORDER BY cnt, KAMPANYA_ADI) AS en_buyuk_kampanya_musteri
-    FROM (
-        SELECT HAFTA_MIN, KAMPANYA_ADI, COUNT(*) AS cnt
-        FROM cw
-        WHERE KAMPANYALI = 1
-        GROUP BY HAFTA_MIN, KAMPANYA_ADI
-    )
-    GROUP BY HAFTA_MIN
 )
+/* ----------------------------------------------------------------
+   KOLON SOZLUGU (her feature ne anlatir):
+   MIN/MAX_HAFTA            : haftanin Pzt / Cuma'si
+   -- SAYI (adet) --
+   toplam_musteri           : o hafta aktif TL musteri (son is gunu snapshot)
+   kampanyali_musteri       : ekstra kampanyasi olan (KAMPANYA_ADI dolu)
+   baseline_musteri         : kampanyasiz (pure_osawelcome evreni)
+   welcome_ustu_musteri     : KAMPANYA_FAIZ_ORANI > o gunku welcome olan
+   farkli_kampanya_sayisi   : o hafta kac AYRI kampanya adi aktif
+   -- SAYI ORANI (adet payi, 0-1) --
+   kampanyali_orani         : kampanyali / toplam        (kitlenin ne kadari kampanyali)
+   baseline_orani           : baseline / toplam
+   welcome_ustu_orani       : welcome_ustu / toplam
+   -- HACIM (TH_TOTAL_BAKIYE, TL) --
+   toplam_hacim             : tum musterilerin bakiye toplami
+   kampanyali_hacim         : kampanyalilarin bakiyesi
+   baseline_hacim           : baseline bakiyesi
+   welcome_ustu_hacim       : welcome ustu musterilerin bakiyesi
+   -- HACIM ORANI (bakiye payi, 0-1) --
+   kampanyali_hacim_orani   : kampanyali_hacim / toplam_hacim
+       >>> kampanyali_orani (adet) DUSUK ama bu YUKSEK ise: az sayida AMA buyuk-bakiyeli musteriye ekstra rate
+   baseline_hacim_orani / welcome_ustu_hacim_orani : ayni mantik
+   -- ORTALAMA BAKIYE (musteri basi, TL) --
+   kampanyali_ort_bakiye    : kampanyali_hacim / kampanyali_musteri (kampanyali tipik buyukluk)
+   baseline_ort_bakiye      : baseline tipik buyukluk
+       >>> kampanyali_ort_bakiye >> baseline_ort_bakiye ise: kampanya buyuk musteriye gidiyor
+   -- KAMPANYA RATE --
+   ort_kampanya_rate        : kampanyalilarin ortalama KAMPANYA_FAIZ_ORANI (kampanya agresifligi)
+   kampanya_primi           : ort(KAMPANYA_FAIZ_ORANI - welcome) — welcome ustu prim buyuklugu
+   -- BITIS (outflow oncusu) --
+   welcome_bitiyor_bu/gelecek_hafta        : baseline welcome'i biten musteri ADEDI
+   welcome_bitiyor_*_hacim                  : ayni, TL bazinda (asil risk olcusu)
+   kampanya_bitiyor_gelecek_hafta(_hacim)   : ekstra kampanyasi biten (adet / TL)
+   -- BASLANGIC (inflow oncusu) --
+   kampanya_basliyor_bu_hafta(_hacim)       : bu hafta yeni kampanya tanimlanan (adet / TL)
+   -- DEGISIM (WoW momentum) --
+   *_degisim                : bu hafta - gecen hafta (LAG); ilk hafta NULL
+   ---------------------------------------------------------------- */
 SELECT
     a.HAFTA_MIN                      AS MIN_HAFTA,
     a.HAFTA_MIN + 4                  AS MAX_HAFTA,
+    /* --- SAYI (adet) --- */
     a.toplam_musteri,
     a.kampanyali_musteri,
     a.baseline_musteri,
-    a.farkli_kampanya_sayisi,
-    t.en_buyuk_kampanya,
-    t.en_buyuk_kampanya_musteri,
     a.welcome_ustu_musteri,
+    a.farkli_kampanya_sayisi,
+    /* --- SAYI ORANI (musteri adedine gore pay) --- */
+    ROUND(a.kampanyali_musteri  / NULLIF(a.toplam_musteri, 0), 4) AS kampanyali_orani,
+    ROUND(a.baseline_musteri    / NULLIF(a.toplam_musteri, 0), 4) AS baseline_orani,
+    ROUND(a.welcome_ustu_musteri/ NULLIF(a.toplam_musteri, 0), 4) AS welcome_ustu_orani,
+    /* --- HACIM (TH_TOTAL_BAKIYE) --- */
+    a.toplam_hacim,
+    a.kampanyali_hacim,
+    a.baseline_hacim,
+    a.welcome_ustu_hacim,
+    /* --- HACIM ORANI (bakiye payi) --- */
+    ROUND(a.kampanyali_hacim  / NULLIF(a.toplam_hacim, 0), 4) AS kampanyali_hacim_orani,
+    ROUND(a.baseline_hacim    / NULLIF(a.toplam_hacim, 0), 4) AS baseline_hacim_orani,
+    ROUND(a.welcome_ustu_hacim/ NULLIF(a.toplam_hacim, 0), 4) AS welcome_ustu_hacim_orani,
+    /* --- ORTALAMA BAKIYE (musteri basi) --- */
+    ROUND(a.kampanyali_hacim / NULLIF(a.kampanyali_musteri, 0), 0) AS kampanyali_ort_bakiye,
+    ROUND(a.baseline_hacim   / NULLIF(a.baseline_musteri, 0), 0)   AS baseline_ort_bakiye,
+    /* --- KAMPANYA RATE --- */
+    a.ort_kampanya_rate,
+    a.kampanya_primi,
+    /* --- BITIS (adet) --- */
     a.welcome_bitiyor_bu_hafta,
     a.welcome_bitiyor_gelecek_hafta,
-    a.kampanya_bitiyor_bu_hafta,
-    a.kampanya_bitiyor_gelecek_hafta
+    a.kampanya_bitiyor_gelecek_hafta,
+    /* --- BITIS (hacim, TL) --- */
+    a.welcome_bitiyor_bu_hafta_hacim,
+    a.welcome_bitiyor_gelecek_hafta_hacim,
+    a.kampanya_bitiyor_gelecek_hafta_hacim,
+    /* --- BASLANGIC --- */
+    a.kampanya_basliyor_bu_hafta,
+    a.kampanya_basliyor_bu_hafta_hacim,
+    /* --- DEGISIM (WoW: bu hafta - gecen hafta) --- */
+    a.toplam_musteri     - LAG(a.toplam_musteri)     OVER (ORDER BY a.HAFTA_MIN) AS toplam_musteri_degisim,
+    a.kampanyali_musteri - LAG(a.kampanyali_musteri) OVER (ORDER BY a.HAFTA_MIN) AS kampanyali_musteri_degisim,
+    a.toplam_hacim       - LAG(a.toplam_hacim)       OVER (ORDER BY a.HAFTA_MIN) AS toplam_hacim_degisim,
+    a.kampanyali_hacim   - LAG(a.kampanyali_hacim)   OVER (ORDER BY a.HAFTA_MIN) AS kampanyali_hacim_degisim
 FROM wk_all a
-LEFT JOIN wk_top t ON a.HAFTA_MIN = t.HAFTA_MIN
 ORDER BY a.HAFTA_MIN;
