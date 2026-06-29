@@ -1,3 +1,30 @@
+camp = df_campaign.copy()
+camp.columns = [c.lower() for c in camp.columns]          # Oracle UPPER -> lower
+camp = camp.sort_values('min_hafta').reset_index(drop=True)  # WoW icin sirali olmali
+
+# ── 1) ORANLAR (adet payi) ───────────────────────────────────────────────────
+camp['kampanyali_orani']   = camp['kampanyali_musteri']   / camp['toplam_musteri'].replace(0, np.nan)
+camp['baseline_orani']     = camp['baseline_musteri']     / camp['toplam_musteri'].replace(0, np.nan)
+camp['welcome_ustu_orani'] = camp['welcome_ustu_musteri'] / camp['toplam_musteri'].replace(0, np.nan)
+
+# ── 2) HACIM ORANLARI (bakiye payi) ──────────────────────────────────────────
+camp['kampanyali_hacim_orani']   = camp['kampanyali_hacim']   / camp['toplam_hacim'].replace(0, np.nan)
+camp['baseline_hacim_orani']     = camp['baseline_hacim']     / camp['toplam_hacim'].replace(0, np.nan)
+camp['welcome_ustu_hacim_orani'] = camp['welcome_ustu_hacim'] / camp['toplam_hacim'].replace(0, np.nan)
+
+# ── 3) ORTALAMA BAKIYE (musteri basi) — "az musteri / cok hacim" gostergesi ──
+camp['kampanyali_ort_bakiye'] = camp['kampanyali_hacim'] / camp['kampanyali_musteri'].replace(0, np.nan)
+camp['baseline_ort_bakiye']   = camp['baseline_hacim']   / camp['baseline_musteri'].replace(0, np.nan)
+
+# ── 4) WoW DEGISIM (bu hafta - gecen hafta); ilk hafta NaN -> 0 ──────────────
+for _c in ['toplam_musteri', 'kampanyali_musteri', 'toplam_hacim', 'kampanyali_hacim']:
+    camp[f'{_c}_degisim'] = camp[_c].diff().fillna(0)
+
+# ── 5) Join anahtari + mukerrer tarih kolonlarini at ─────────────────────────
+camp['_key'] = pd.to_datetime(camp['min_hafta']).dt.strftime('%Y-%m-%d')
+camp = camp.drop(columns=[c for c in ['min_hafta', 'max_hafta'] if c in camp.columns])
+   
+   
 /* ================================================================
    KAMPANYA / WELCOME HAFTALIK TABLO — SADE.
    Haftada TEK satir = haftanin SON IS GUNU snapshot'i.
