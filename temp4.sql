@@ -1,30 +1,3 @@
-camp = df_campaign.copy()
-camp.columns = [c.lower() for c in camp.columns]          # Oracle UPPER -> lower
-camp = camp.sort_values('min_hafta').reset_index(drop=True)  # WoW icin sirali olmali
-
-# ── 1) ORANLAR (adet payi) ───────────────────────────────────────────────────
-camp['kampanyali_orani']   = camp['kampanyali_musteri']   / camp['toplam_musteri'].replace(0, np.nan)
-camp['baseline_orani']     = camp['baseline_musteri']     / camp['toplam_musteri'].replace(0, np.nan)
-camp['welcome_ustu_orani'] = camp['welcome_ustu_musteri'] / camp['toplam_musteri'].replace(0, np.nan)
-
-# ── 2) HACIM ORANLARI (bakiye payi) ──────────────────────────────────────────
-camp['kampanyali_hacim_orani']   = camp['kampanyali_hacim']   / camp['toplam_hacim'].replace(0, np.nan)
-camp['baseline_hacim_orani']     = camp['baseline_hacim']     / camp['toplam_hacim'].replace(0, np.nan)
-camp['welcome_ustu_hacim_orani'] = camp['welcome_ustu_hacim'] / camp['toplam_hacim'].replace(0, np.nan)
-
-# ── 3) ORTALAMA BAKIYE (musteri basi) — "az musteri / cok hacim" gostergesi ──
-camp['kampanyali_ort_bakiye'] = camp['kampanyali_hacim'] / camp['kampanyali_musteri'].replace(0, np.nan)
-camp['baseline_ort_bakiye']   = camp['baseline_hacim']   / camp['baseline_musteri'].replace(0, np.nan)
-
-# ── 4) WoW DEGISIM (bu hafta - gecen hafta); ilk hafta NaN -> 0 ──────────────
-for _c in ['toplam_musteri', 'kampanyali_musteri', 'toplam_hacim', 'kampanyali_hacim']:
-    camp[f'{_c}_degisim'] = camp[_c].diff().fillna(0)
-
-# ── 5) Join anahtari + mukerrer tarih kolonlarini at ─────────────────────────
-camp['_key'] = pd.to_datetime(camp['min_hafta']).dt.strftime('%Y-%m-%d')
-camp = camp.drop(columns=[c for c in ['min_hafta', 'max_hafta'] if c in camp.columns])
-   
-   
 /* ================================================================
    KAMPANYA / WELCOME HAFTALIK TABLO — SADE.
    Haftada TEK satir = haftanin SON IS GUNU snapshot'i.
@@ -33,8 +6,10 @@ camp = camp.drop(columns=[c for c in ['min_hafta', 'max_hafta'] if c in camp.col
 
    Kavramlar:
    - BONUS_*    = STANDART OSAWelcome (HERKES). BONUS_BIT_TARIHI = welcome bitisi.
-   - KAMPANYA_* = EKSTRA kampanya (bazilarinda). BAS/BIT = ekstra basi/bitisi.
-   - "ekstra musteri" = KAMPANYA_ADI IS NOT NULL.
+   - KAMPANYALI = "ekstra musteri" = "osawelcome USTU" = o hafta MAIN_FAIZ_COD'u
+     (141,181,201,241,261) olanlar. Bu kodlar DISINDAKILER standart osawelcome alir.
+     >>> kampanyali == welcome_ustu (ikisi de ayni kod kumesi). KOLON ADI DOGRULA: MAIN_FAIZ_COD.
+   - KAMPANYA_BAS/BIT_TARIHI = ekstra kampanyanin basi/bitisi.
 
    3 CTE: snapshot_days (son is gunu) -> cust_week (hafta,musteri) -> welcome (haftalik rate).
    Hafta: Pzt(16.09.2024) referans. Kolon adlarini gerekirse degistir.
@@ -62,7 +37,7 @@ cust_week AS (
     SELECT
         t.RAPOR_TARIHI - MOD(t.RAPOR_TARIHI - DATE '2024-09-16', 7) AS HAFTA_MIN,
         t.MUSTERI_NO,
-        MAX(CASE WHEN t.KAMPANYA_ADI IS NOT NULL THEN 1 ELSE 0 END) AS KAMPANYALI,
+        MAX(CASE WHEN t.MAIN_FAIZ_COD IN (141, 181, 201, 241, 261) THEN 1 ELSE 0 END) AS KAMPANYALI,  -- osawelcome USTU = bu kodlar
         MAX(t.KAMPANYA_FAIZ_ORANI)  AS KAMPANYA_FAIZ_ORANI,
         MAX(t.BONUS_BIT_TARIHI)     AS BONUS_BIT_TARIHI,
         MAX(t.KAMPANYA_BAS_TARIHI)  AS KAMPANYA_BAS_TARIHI,
@@ -90,13 +65,13 @@ SELECT
     COUNT(*)                                                         AS toplam_musteri,
     SUM(c.KAMPANYALI)                                               AS kampanyali_musteri,
     SUM(1 - c.KAMPANYALI)                                           AS baseline_musteri,
-    SUM(CASE WHEN c.KAMPANYA_FAIZ_ORANI > w.OSAWelcome + 0.0001 THEN 1 ELSE 0 END) AS welcome_ustu_musteri,
+    SUM(c.KAMPANYALI)                                              AS welcome_ustu_musteri,   -- = kampanyali_musteri (MAIN_FAIZ_COD = welcome ustu)
     COUNT(DISTINCT c.KAMPANYA_ADI)                                 AS farkli_kampanya_sayisi,
     /* hacim (TH_TOTAL_BAKIYE) */
     SUM(c.MUSTERI_HACIM)                                            AS toplam_hacim,
     SUM(CASE WHEN c.KAMPANYALI = 1 THEN c.MUSTERI_HACIM ELSE 0 END) AS kampanyali_hacim,
     SUM(CASE WHEN c.KAMPANYALI = 0 THEN c.MUSTERI_HACIM ELSE 0 END) AS baseline_hacim,
-    SUM(CASE WHEN c.KAMPANYA_FAIZ_ORANI > w.OSAWelcome + 0.0001 THEN c.MUSTERI_HACIM ELSE 0 END) AS welcome_ustu_hacim,
+    SUM(CASE WHEN c.KAMPANYALI = 1 THEN c.MUSTERI_HACIM ELSE 0 END) AS welcome_ustu_hacim,        -- = kampanyali_hacim
     /* kampanya rate ortalamasi + welcome primi (kampanyalilarda) */
     ROUND(AVG(CASE WHEN c.KAMPANYALI = 1 THEN c.KAMPANYA_FAIZ_ORANI END), 2)              AS ort_kampanya_rate,
     ROUND(AVG(CASE WHEN c.KAMPANYALI = 1 THEN c.KAMPANYA_FAIZ_ORANI - w.OSAWelcome END), 2) AS kampanya_primi,
